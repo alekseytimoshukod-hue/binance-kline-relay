@@ -1,136 +1,154 @@
 // server.js
-import 'dotenv/config';
-import http from 'http';
-import axios from 'axios';
-import WebSocket from 'ws';
+import http from "http";
+import WebSocket from "ws";
+import axios from "axios";
+import moment from "moment-timezone";
 
-/** ====== ENV ====== */
-const PD_WEBHOOK_1H = process.env.PD_WEBHOOK_1H;         // �� Pipedream (SPOT_LONG Generator)
-const PD_WEBHOOK_4H = process.env.PD_WEBHOOK_4H;         // �� Pipedream (Crypto Alert Bot)
-const SECRET        = process.env.WEBHOOK_SECRET || '';
+// --------- ENV & CONFIG ---------
+const SYMBOLS = (process.env.SYMBOLS || "BTCUSDT,ETHUSDT,SOLUSDT")
+  .split(",")
+  .map(s => s.trim().toUpperCase())
+  .filter(Boolean);
 
-const SYMBOLS   = (process.env.SYMBOLS || 'BTCUSDT,ETHUSDT,SOLUSDT').split(',');
-const INTERVALS = ['1h','4h'];
+const PD_1H = process.env.PD_WEBHOOK_1H || "";
+const PD_4H = process.env.PD_WEBHOOK_4H || "";
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
 
-/** ��������� / batching */
-const THROTTLE_SEC   = parseInt(process.env.THROTTLE_SEC || '20', 10);
-const MIN_PCT_MOVE   = parseFloat(process.env.MIN_PCT_MOVE || '0.10'); // 0.10%
-const BATCH_WINDOWMS = parseInt(process.env.BATCH_WINDOW_MS || '3000', 10);
+const THROTTLE_SEC = Number(process.env.THROTTLE_SEC || 2);      // мин. интервал отправки по одному символу
+const MIN_PCT_MOVE = Number(process.env.MIN_PCT_MOVE || 0.0005); // 0.05% — минимальное изменение цены
+const BATCH_WINDOW_MS = Number(process.env.BATCH_WINDOW_MS || 800);
 
-/** ====== WS URL ====== */
-const streams = [];
-for (const s of SYMBOLS) for (const i of INTERVALS) streams.push(`${s.toLowerCase()}@kline_${i}`);
-const WS_URL = `wss://stream.binance.com:9443/stream?streams=${streams.join('/')}`;
+const WS_BASE = "wss://stream.binance.com:9443";
+const PORT = process.env.PORT || 3000;
 
-/** ====== ��������� ====== */
-let ws, pingTimer;
-const lastSent = new Map();                      // key="SYMBOL|INTERVAL" -> { ts, price, high, low }
-const buffers  = { '1h': [], '4h': [] };
-const timers   = { '1h': null, '4h': null };
+// --------- HTTP (health) ---------
+const server = http.createServer((req, res) => {
+  if (req.url === "/health") {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    return res.end("ok");
+  }
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("spot_long_ws running\n");
+});
+server.listen(PORT, () => console.log(`[HTTP] Listening on :${PORT}`));
 
-function queue(interval, payload) {
-  buffers[interval].push(payload);
-  if (!timers[interval]) {
-    timers[interval] = setTimeout(async () => {
-      const arr = buffers[interval].splice(0);
-      timers[interval] = null;
-      try {
-        const url = interval === '1h' ? PD_WEBHOOK_1H : PD_WEBHOOK_4H;
-        if (!url || arr.length === 0) return;
-        await axios.post(url, arr, { headers: { 'X-Auth': SECRET } });
-        console.log(`POST ${interval}:`, arr.length);
-      } catch (e) {
-        console.error(`POST ${interval} error:`, e.message);
-      }
-    }, BATCH_WINDOWMS);
+// --------- WS client ---------
+let ws;
+let pingTimer;
+let reconnectTimer;
+
+const makeStreams = (symbols) =>
+  symbols.map(s => `${s.toLowerCase()}@miniTicker`).join("/");
+
+const makeUrl = (symbols) =>
+  `${WS_BASE}/stream?streams=${makeStreams(symbols)}`;
+
+const lastPrice = new Map();     // последняя полученная цена (для % изменения)
+const lastSentAt = new Map();    // когда по символу последний раз отправляли
+let batch = [];                  // буфер батча
+let batchTimer = null;
+
+function queue(item) {
+  batch.push(item);
+  if (batchTimer) return;
+  batchTimer = setTimeout(flushBatch, BATCH_WINDOW_MS);
+}
+
+async function flushBatch() {
+  const items = batch;
+  batch = [];
+  clearTimeout(batchTimer);
+  batchTimer = null;
+  if (!items.length) return;
+
+  const payload = { items };
+  const headers = { "x-auth": WEBHOOK_SECRET };
+
+  try {
+    if (PD_1H) await axios.post(PD_1H, payload, { headers, timeout: 8000 });
+    if (PD_4H) await axios.post(PD_4H, payload, { headers, timeout: 8000 });
+    console.log(`[POST] ${items.length} items -> PD`);
+  } catch (e) {
+    console.log(`[POST ERROR] ${e?.message || e}`);
   }
 }
-function shouldSendLive(key, price, high, low) {
-  const now = Date.now();
-  const s = lastSent.get(key) || { ts: 0, price: 0, high, low };
-  const dt = (now - s.ts) / 1000;
-  if (dt < THROTTLE_SEC) return false;
-  if (s.price === 0) return true;
-  const pct = Math.abs(price - s.price) / s.price * 100;
-  return pct >= MIN_PCT_MOVE || high > s.high || low < s.low;
-}
-function markSent(key, price, high, low) {
-  lastSent.set(key, { ts: Date.now(), price, high, low });
-}
 
-/** ====== WS client ====== */
 function connect() {
-  console.log('Connecting WS:', WS_URL);
-  ws = new WebSocket(WS_URL);
+  const url = makeUrl(SYMBOLS);
+  console.log(`[WS] Connecting: ${url}`);
+  ws = new WebSocket(url);
 
-  ws.on('open', () => {
-    console.log('WS connected');
+  ws.on("open", () => {
+    console.log("[WS open]");
     clearInterval(pingTimer);
-    pingTimer = setInterval(() => { try { ws.ping(); } catch {} }, 60_000);
+    pingTimer = setInterval(() => { try { ws.ping(); } catch {} }, 15_000);
   });
 
-  ws.on('message', (raw) => {
+  ws.on("message", (raw) => {
     try {
-      const msg = JSON.parse(raw.toString());
-      const d = msg?.data;
-      if (d?.e !== 'kline' || !d?.k) return;
+      const packet = JSON.parse(raw.toString());
+      // формат combined stream: { stream: 'btcusdt@miniticker', data: {...} }
+      const data = packet?.data || packet;
+      const symbol = (data?.s || "").toUpperCase();
+      const price = parseFloat(data?.c || "0");
+      if (!symbol || !Number.isFinite(price)) return;
 
-      const k = d.k; // ������ �����
-      const interval = k.i; // '1h' | '4h'
-      if (interval !== '1h' && interval !== '4h') return;
+      const prevPrice = lastPrice.get(symbol);
+      lastPrice.set(symbol, price);
 
-      const key   = `${d.s}|${interval}`;
-      const close = Number(k.c);
-      const high  = Number(k.h);
-      const low   = Number(k.l);
-      const isFinal = !!k.x;
+      const now = Date.now();
+      const lastTs = lastSentAt.get(symbol) || 0;
+      const dtOk = now - lastTs >= THROTTLE_SEC * 1000;
+      let pctOk = true;
 
-      if (isFinal || shouldSendLive(key, close, high, low)) {
-        const payload = {
-          symbol: d.s,
-          interval,
-          openTime: k.t,
-          closeTime: k.T,
-          open: k.o,
-          high: k.h,
-          low:  k.l,
-          close: k.c,
-          volume: k.v,
-          isFinal,
-          reason: isFinal ? 'candle_close' : 'live_update',
-        };
-        queue(interval, payload);
-        markSent(key, close, high, low);
+      if (prevPrice && prevPrice > 0) {
+        const pct = Math.abs(price / prevPrice - 1);
+        pctOk = pct >= MIN_PCT_MOVE;
+      }
+
+      if (dtOk && pctOk) {
+        lastSentAt.set(symbol, now);
+        queue({ symbol, price, ts: now });
+        // лёгкий лог раз в ~2% сообщений
+        if (Math.random() < 0.02) {
+          console.log(`[TICK] ${symbol} ${price} @ ${moment.utc(now).format("HH:mm:ss")}`);
+        }
       }
     } catch (e) {
-      console.error('WS message error:', e.message);
+      // игнорим единичные проблемы парсинга
     }
   });
 
-  ws.on('close', () => {
-    console.warn('WS closed. Reconnecting in 3s...');
-    clearInterval(pingTimer);
-    setTimeout(connect, 3000);
+  ws.on("close", (code, reason) => {
+    console.log(`[WS close] ${code} ${reason}`);
+    cleanup();
+    scheduleReconnect();
   });
 
-  ws.on('error', (err) => {
-    console.error('WS error:', err.message);
-    try { ws.close(); } catch {}
+  ws.on("error", (err) => {
+    console.log("[WS error]", err?.message || err);
+    cleanup();
+    scheduleReconnect();
   });
 }
 
-/** ====== HTTP (health) ====== */
-const server = http.createServer((req, res) => {
-  if (req.url === '/health') {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    return res.end('ok');
-  }
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('binance-kline-relay\n');
-});
+function cleanup() {
+  try { ws?.close(); } catch {}
+  ws = null;
+  clearInterval(pingTimer);
+  pingTimer = null;
+}
 
-const port = process.env.PORT || 8080; // Render ��� ��������� PORT
-server.listen(port, () => {
-  console.log('HTTP server on', port);
-  connect();
-});
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connect();
+  }, 3000);
+}
+
+connect();
+
+// мягкое завершение
+process.on("SIGTERM", () => { console.log("SIGTERM"); process.exit(0); });
+process.on("SIGINT",  () => { console.log("SIGINT");  process.exit(0); });
