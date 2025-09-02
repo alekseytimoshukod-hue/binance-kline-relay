@@ -1,0 +1,24 @@
+name: Ping Render Health
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # каждые 5 минут (UTC)
+  workflow_dispatch:        # возможность запустить вручную
+
+permissions: {}
+concurrency:
+  group: ping-render
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Curl health endpoint
+        env:
+          PING_URL: ${{ secrets.PING_URL }}
+        run: |
+          echo "Pinging $PING_URL"
+          curl -fsSI --max-time 10 "$PING_URL" >/dev/null
+          echo "OK"
