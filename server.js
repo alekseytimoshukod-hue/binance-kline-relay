@@ -4,26 +4,37 @@ import WebSocket from "ws";
 import axios from "axios";
 import moment from "moment-timezone";
 
-// --------- ENV & CONFIG ---------
+// ================== ENV & CONFIG ==================
+/**
+ * ОБЯЗАТЕЛЬНО в Render → Environment:
+ *   SYMBOLS            (опц.)  "BTCUSDT,ETHUSDT,SOLUSDT,…"
+ *   PD_WEBHOOK_1H      (url)   триггер Pipedream для 1h
+ *   PD_WEBHOOK_4H      (url)   триггер Pipedream для 4h (если нужен; можно пусто)
+ *   WEBHOOK_SECRET     (str)   должен совпадать с WEBHOOK_SECRET в Pipedream
+ *   SELF_URL           (url)   https://<твой-сервис>.onrender.com  — для самопинга
+ *   THROTTLE_SEC       (num)   минимальный интервал отправки по символу (по умолч. 2 сек)
+ *   MIN_PCT_MOVE       (num)   минимальное изменение для тикета (по умолч. 0.0005 = 0.05%)
+ *   BATCH_WINDOW_MS    (num)   окно батча (по умолч. 800 мс)
+ */
+
 const SYMBOLS = (process.env.SYMBOLS || "BTCUSDT,ETHUSDT,SOLUSDT")
   .split(",")
   .map(s => s.trim().toUpperCase())
   .filter(Boolean);
 
-const PD_1H = process.env.PD_WEBHOOK_1H || "";   // Pipedream ingest для 1H-воркфлоу
-const PD_4H = process.env.PD_WEBHOOK_4H || "";   // Pipedream ingest для 4H-воркфлоу (если используете)
+const PD_1H = process.env.PD_WEBHOOK_1H || "";
+const PD_4H = process.env.PD_WEBHOOK_4H || "";
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
+const SELF_URL = process.env.SELF_URL || "";
 
-const THROTTLE_SEC    = Number(process.env.THROTTLE_SEC    || 2);      // мин. интервал отправки по одному символу
-const MIN_PCT_MOVE    = Number(process.env.MIN_PCT_MOVE    || 0.0005); // 0.05% — минимальное изменение
+const THROTTLE_SEC    = Number(process.env.THROTTLE_SEC    || 2);
+const MIN_PCT_MOVE    = Number(process.env.MIN_PCT_MOVE    || 0.0005);
 const BATCH_WINDOW_MS = Number(process.env.BATCH_WINDOW_MS || 800);
-
-const SELF_URL = process.env.SELF_URL || ""; // https://<ваш-сервис>.onrender.com
 
 const WS_BASE = "wss://stream.binance.com:9443";
 const PORT = process.env.PORT || 3000;
 
-// --------- HTTP (health) ---------
+// ================== HTTP (health) ==================
 const server = http.createServer((req, res) => {
   if (req.url === "/health") {
     res.writeHead(200, { "Content-Type": "text/plain" });
@@ -33,16 +44,26 @@ const server = http.createServer((req, res) => {
   res.end("spot_long_ws running\n");
 });
 
-server.listen(PORT, () => console.log(`[HTTP] Listening on :${PORT}`));
+server.listen(PORT, () => {
+  console.log(`[HTTP] Listening on :${PORT}`);
+  // небольшой диагностический лог
+  const maskHost = (u) => {
+    try { const { hostname, pathname } = new URL(u); return hostname + pathname; } catch { return ""; }
+  };
+  console.log(`[CFG] symbols=${SYMBOLS.join(",")}`);
+  console.log(`[CFG] PD_1H=${PD_1H ? maskHost(PD_1H) : "-"}`);
+  console.log(`[CFG] PD_4H=${PD_4H ? maskHost(PD_4H) : "-"}`);
+  console.log(`[CFG] SELF_URL=${SELF_URL || "-"}`);
+});
 
-// Самопинг, чтобы Render не «засыпал»
+// Самопинг Render, чтобы не «засыпал»
 if (SELF_URL) {
   setInterval(() => {
     axios.head(`${SELF_URL}/health`).catch(() => {});
-  }, 60_000); // раз в минуту
+  }, 60_000);
 }
 
-// --------- WS client ---------
+// ================== WS client ==================
 let ws;
 let pingTimer;
 let reconnectTimer;
@@ -54,19 +75,18 @@ const makeUrl = (symbols) =>
   `${WS_BASE}/stream?streams=${makeStreams(symbols)}`;
 
 const lastPrice  = new Map(); // последняя цена для %-фильтра
-const lastSentAt = new Map(); // когда по символу последний раз отправляли
+const lastSentAt = new Map(); // последний отправленный тик по символу
 
 let batch = [];         // буфер батча
 let batchTimer = null;
 
-// помощник: рассчитываем openTime бара
+// отметка начала бара для 1h/4h
 const barOpen = (ts, interval) => {
   const t = Number(ts) || Date.now();
   if (interval === "4h") {
     const fourH = 4 * 60 * 60 * 1000;
     return Math.floor(t / fourH) * fourH;
   }
-  // по умолчанию 1h
   const oneH = 60 * 60 * 1000;
   return Math.floor(t / oneH) * oneH;
 };
@@ -84,7 +104,7 @@ async function flushBatch() {
   batchTimer = null;
   if (!items.length) return;
 
-  // Для 1H и 4H формируем отдельные полезные нагрузки с корректным interval/openTime
+  // Подготавливаем полезные нагрузки с корректным interval/openTime
   const items1h = items.map(({ symbol, price, ts }) => ({
     symbol, price, ts,
     interval: "1h",
@@ -102,8 +122,12 @@ async function flushBatch() {
   const headers = { "x-auth": WEBHOOK_SECRET };
 
   try {
-    if (PD_1H) await axios.post(PD_1H, { items: items1h }, { headers, timeout: 8000 });
-    if (PD_4H) await axios.post(PD_4H, { items: items4h }, { headers, timeout: 8000 });
+    if (PD_1H) {
+      await axios.post(PD_1H, { items: items1h }, { headers, timeout: 8000 });
+    }
+    if (PD_4H) {
+      await axios.post(PD_4H, { items: items4h }, { headers, timeout: 8000 });
+    }
     console.log(`[POST] ${items.length} items -> PD (1h${PD_1H?"+":""}, 4h${PD_4H?"+":""})`);
   } catch (e) {
     console.log(`[POST ERROR] ${e?.message || e}`);
@@ -145,15 +169,16 @@ function connect() {
 
       if (dtOk && pctOk) {
         lastSentAt.set(symbol, now);
+        // кладём «сырой» тик, интервал и openTime добавим в flushBatch
         queue({ symbol, price, ts: now });
 
-        // лёгкий лог раз в ~2% сообщений
+        // лёгкий лог ~2% сообщений
         if (Math.random() < 0.02) {
           console.log(`[TICK] ${symbol} ${price} @ ${moment.utc(now).format("HH:mm:ss")} UTC`);
         }
       }
     } catch {
-      // игнорим единичные проблемы парсинга
+      // тихо игнорим единичные проблемы парсинга
     }
   });
 
@@ -187,6 +212,8 @@ function scheduleReconnect() {
 
 connect();
 
-// мягкое завершение
+// ================== graceful shutdown ==================
 process.on("SIGTERM", () => { console.log("SIGTERM"); process.exit(0); });
 process.on("SIGINT",  () => { console.log("SIGINT");  process.exit(0); });
+process.on("unhandledRejection", (e) => console.log("[unhandledRejection]", e?.message || e));
+process.on("uncaughtException", (e) => console.log("[uncaughtException]", e?.message || e));
